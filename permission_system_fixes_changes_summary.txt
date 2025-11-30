@@ -1,0 +1,110 @@
+Permission System Fixes - Changes Summary
+========================================
+
+Date: November 30, 2025
+Issue: JWT tokens showing empty permissions (perms:[]) when superadmin creates permissions for users
+
+Root Causes Identified:
+1. Role initialization code was commented out, so required roles didn't exist
+2. No permission initialization in the database
+3. No role-permission assignments
+4. Permission management endpoints were missing
+
+Files Modified:
+===============
+
+1. src/main/java/com/pujan/userservice/UserserviceApplication.java
+--------------------------------------------------------------------
+
+**Changes Made:**
+- Uncommented and enhanced the `initRoles` CommandLineRunner to include permission-related roles:
+  - Added: "ACADEMIC_VIEWER", "ACADEMIC_EDITOR", "PROGRAMME_VIEWER", "PROGRAMME_EDITOR"
+- Added new `initPermissions` CommandLineRunner to create basic permissions:
+  - PROGRAM:ACADEMIC:READ
+  - PROGRAM:ACADEMIC:UPDATE
+  - PROGRAM:PROGRAMME:READ
+  - PROGRAM:PROGRAMME:UPDATE
+  - IAM:MANAGE_USER_PERMISSIONS
+- Added new `initRolePermissions` CommandLineRunner to assign permissions to roles:
+  - ACADEMIC_VIEWER: PROGRAM:ACADEMIC:READ
+  - ACADEMIC_EDITOR: PROGRAM:ACADEMIC:READ, PROGRAM:ACADEMIC:UPDATE
+  - PROGRAMME_VIEWER: PROGRAM:PROGRAMME:READ
+  - PROGRAMME_EDITOR: PROGRAM:PROGRAMME:READ, PROGRAM:PROGRAMME:UPDATE
+  - ROLE_SUPER_ADMIN: All permissions
+  - ROLE_ADMIN: IAM:MANAGE_USER_PERMISSIONS
+- Removed unused imports (Users, UsersRepo)
+
+**Purpose:**
+Ensures that all required roles and permissions exist in the database on application startup,
+and that roles have the correct permissions assigned to them.
+
+2. src/main/java/com/pujan/userservice/Controller/AdminController.java
+---------------------------------------------------------------------
+
+**Changes Made:**
+- Added import for CreatePermissionRequest DTO
+- Added new permission management endpoints:
+  - POST /admin/users/permissions - Create new permissions
+  - GET /admin/users/permissions - Get all permissions
+  - GET /admin/users/roles/{roleId}/permissions - Get permissions for a specific role
+  - PUT /admin/users/roles/{roleId}/permissions - Update permissions assigned to a role
+  - GET /admin/users/roles - Get all roles
+- Updated createPermission method to use CreatePermissionRequest DTO instead of Permission entity
+
+**Purpose:**
+Provides comprehensive permission and role management capabilities for administrators.
+
+3. src/main/java/com/pujan/userservice/DTO/CreatePermissionRequest.java (NEW FILE)
+----------------------------------------------------------------------------------
+
+**Changes Made:**
+- Created new DTO class with fields:
+  - code: String
+  - resource: String
+  - action: String
+  - description: String
+
+**Purpose:**
+Clean API contract for permission creation, separating request data from entity model.
+
+How the Fix Works:
+==================
+
+1. **Database Initialization:**
+   On application startup, CommandLineRunners create:
+   - Required roles (ACADEMIC_VIEWER, ACADEMIC_EDITOR, etc.)
+   - Basic permissions (PROGRAM:ACADEMIC:READ, etc.)
+   - Role-permission mappings (ACADEMIC_VIEWER gets PROGRAM:ACADEMIC:READ)
+
+2. **Permission Assignment Flow:**
+   When superadmin calls PUT /admin/users/{id}/permissions with ["PROGRAM:ACADEMIC:READ"]:
+   - System finds ACADEMIC_VIEWER role (now exists in DB)
+   - Assigns ACADEMIC_VIEWER role to user
+   - User now has permissions through the role
+   - JWT generation finds permissions via user's roles
+   - JWT contains perms:["PROGRAM:ACADEMIC:READ"]
+
+3. **Permission Management:**
+   Administrators can now:
+   - Create new permissions via API
+   - View all permissions and roles
+   - Assign permissions to roles
+   - Manage the entire permission hierarchy
+
+Expected Outcome:
+=================
+- JWT tokens will now contain the correct permissions array
+- Permission assignment will persist in the database
+- Superadmin can successfully assign permissions to users
+- System supports extensible permission management
+
+Testing:
+========
+1. Start the application - roles and permissions will be auto-created
+2. Login as superadmin
+3. Call PUT /admin/users/{userId}/permissions with permission codes
+4. Check JWT token contains perms array with assigned permissions
+5. Verify permissions are persisted in database
+
+Note: The existing setUserPermissions logic in AdminController was correct in concept
+but failed because required roles didn't exist. With proper initialization, it now works.

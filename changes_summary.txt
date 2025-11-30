@@ -1,0 +1,252 @@
+Detailed summary of changes made by AI assistant
+=============================================
+
+This file lists the main code and UI changes that were applied in your `userservice` project, grouped by file.
+
+--------------------------------------------------
+1. Backend: Security configuration
+--------------------------------------------------
+
+File: src/main/java/com/pujan/userservice/Config/SecurityConfig.java
+
+Key changes:
+
+1.1. Use Spring-managed AuthTokenFilter instead of creating a new instance
+
+- Before:
+  - There was a `@Bean` method:
+    - `public AuthTokenFilter authTokenFilter(){ return new AuthTokenFilter(); }`
+  - And the security filter chain used:
+    - `.addFilterBefore(authTokenFilter(), UsernamePasswordAuthenticationFilter.class)`
+- Problem:
+  - `AuthTokenFilter` is a `@Component` that autowires `JwtUtils` and `UserDetailsService`.
+  - Instantiating it with `new AuthTokenFilter()` bypasses Spring, so its dependencies are null and JWT auth fails.
+- After:
+  - The bean method was removed and replaced by an autowired field:
+    - `@Autowired`
+      `private AuthTokenFilter authTokenFilter;`
+  - The filter chain registration is now:
+    - `.addFilterBefore(authTokenFilter, UsernamePasswordAuthenticationFilter.class)`
+  - This ensures the filter used in the chain is the Spring-managed instance with working dependencies.
+
+1.2. Minor cleanup in exception handling
+
+- `exceptionHandling` lambda changed from:
+  - `exception -> exception .authenticationEntryPoint(unauthorizedHandler)`
+- To:
+  - `exception -> exception.authenticationEntryPoint(unauthorizedHandler)`
+- This is just formatting/clarity, not behavior.
+
+(Other CORS-related lines already present were left as-is.)
+
+--------------------------------------------------
+2. Backend: Registration behavior
+--------------------------------------------------
+
+File: src/main/java/com/pujan/userservice/Controller/AuthController.java
+
+Goal:
+- Ensure that all users who register via the public `/register` endpoint become plain `ROLE_USER`, regardless of what the client sends.
+
+Changes:
+
+- Before:
+  - The controller inspected `users.getRoles()` from the request body and attempted to persist whatever roles were provided:
+    - If roles were null, assigned `ROLE_USER`.
+    - Otherwise, iterated over requested roles, looked them up, and saved them.
+- After:
+  - The code was simplified so that registration **always** assigns only `ROLE_USER`:
+    - `users1.setUsername(...)`, `setPassword(...)`, `setEmail(...)` remain.
+    - Role handling is now:
+      - Create `Set<Role> roles = new HashSet<>();`
+      - Load `ROLE_USER` via `roleRepo.findByName("ROLE_USER")`.
+      - Add that role to the set.
+      - `users1.setRoles(roles);`
+    - Any roles present in the incoming JSON are ignored on the server side.
+
+Result:
+- Anyone registering from the `/register` page will always have only `ROLE_USER`.
+
+--------------------------------------------------
+3. Backend: User management & role rules
+--------------------------------------------------
+
+File: src/main/java/com/pujan/userservice/Controller/UserController.java
+
+This controller provides the protected `/users` API for admins/editors to manage users. The most important logic for your requested behavior is in:
+
+3.1. Role resolution when creating users (resolveRolesForCreate)
+
+- Method: `private Set<Role> resolveRolesForCreate(Authentication auth, Set<String> incomingRoles)`
+
+- Behavior **after** modifications:
+  - Determine caller roles:
+    - `isSuperAdmin` if the authenticated user has `ROLE_SUPER_ADMIN`.
+    - `isAdmin` if they have `ROLE_ADMIN` (but not necessarily super admin).
+    - `isEditor` if they have `ROLE_EDITOR`.
+  - Allowed roles and defaults per caller:
+    - SUPER_ADMIN:
+      - `allowed = { ROLE_ADMIN, ROLE_EDITOR, ROLE_USER }`
+      - `defaultRole = ROLE_USER`
+    - ADMIN:
+      - `allowed = { ROLE_EDITOR }`
+      - `defaultRole = ROLE_EDITOR`
+      - This enforces your rule: **admin can only create editor** (no user, no super admin).
+    - EDITOR:
+      - `allowed = { ROLE_USER }`
+      - `defaultRole = ROLE_USER`
+    - Others:
+      - `allowed = { ROLE_USER }`
+      - `defaultRole = ROLE_USER`.
+  - If `incomingRoles` is null or empty:
+    - Use `defaultRole` as the requested role.
+  - Otherwise, take the set of requested role names and intersect with `allowed`.
+  - If intersection is empty, fall back to `defaultRole`.
+  - Finally, load `Role` entities from `roleRepo` for the effective role names and return them.
+
+- Concrete effect:
+  - SUPER_ADMIN creating a user: can make ADMIN, EDITOR, or USER, depending on request.
+  - ADMIN creating a user: will always result in `ROLE_EDITOR` for the new user, regardless of what the frontend sends.
+  - EDITOR creating a user: can only create `ROLE_USER`.
+
+3.2. Role update rules (updateRoles endpoint)
+
+- Endpoint: `PUT /users/{id}/roles`
+- Annotation: `@PreAuthorize("hasRole('ADMIN')")` (so only admin+ can call).
+- Inside the method, after loading the target user and guarding admin targets, we now compute:
+  - `boolean isSuperAdmin = hasAuthority(auth, "ROLE_SUPER_ADMIN");`
+  - `boolean isAdmin = hasAuthority(auth, "ROLE_ADMIN");`
+- Allowed roles to assign:
+  - If `isSuperAdmin`:
+    - `allowed = { ROLE_ADMIN, ROLE_EDITOR, ROLE_USER }`.
+  - Else if `isAdmin`:
+    - `allowed = { ROLE_EDITOR }` only.
+    - This ensures an admin **cannot** assign SUPER_ADMIN, ADMIN, or USER; only EDITOR.
+  - Else: throw `AccessDeniedException`.
+- Incoming requested roles are validated against `allowed`. Any disallowed role throws an error.
+
+3.3. Guarding ADMIN/SUPER_ADMIN targets (unchanged behavior but important)
+
+- Helper: `private void guardAdminTarget(Users target, Authentication auth)`
+  - Checks if the target user currently has `ROLE_ADMIN` or `ROLE_SUPER_ADMIN`.
+  - If so, and the caller does **not** have `ROLE_SUPER_ADMIN`, it throws `AccessDeniedException`.
+- This means:
+  - Only SUPER_ADMIN can operate on ADMIN/SUPER_ADMIN accounts.
+
+3.4. Endpoints overview
+
+- `GET /users/me` – returns current user profile.
+- `GET /users` – list all users, restricted to admins.
+- `GET /users/{id}` – get details for a specific user (admin or self).
+- `POST /users` – create user, with role rules described above.
+- `PUT /users/{id}` – update basic user fields (email/password), with checks around editing admin/super-admin targets.
+- `PUT /users/{id}/roles` – update roles (admin/super-admin only, with the allowed-role logic above).
+- `DELETE /users/{id}` – delete user, only super admin may delete admin/super-admin accounts.
+
+--------------------------------------------------
+4. Frontend: Registration page (ensuring USER role)
+--------------------------------------------------
+
+File: prompt-ui-builder-main/src/pages/Register.tsx
+
+- The registration form posts to `/register` with payload:
+  - `{ username, email, password, roles: [{ name: 'ROLE_USER' }] }`.
+- The backend now completely ignores incoming roles and always assigns `ROLE_USER`, so even if this payload changes in the future, the server-side rule still holds.
+
+--------------------------------------------------
+5. Frontend: Admin/Super Admin create-user behavior
+--------------------------------------------------
+
+File: prompt-ui-builder-main/src/pages/admin/users/Create.tsx
+
+Goal:
+- Reflect backend rules in the UI:
+  - Admin can only create EDITOR.
+  - Super Admin can choose which role to assign.
+  - Others (e.g. editor) create USER.
+
+5.1. Current-user role detection
+
+- Previously:
+  - A boolean `isAdmin` was true for both `ROLE_ADMIN` and `ROLE_SUPER_ADMIN`.
+- Now:
+  - We compute:
+    - `const roles = user?.roles || [];`
+    - `const isSuperAdmin = roles.includes('ROLE_SUPER_ADMIN');`
+    - `const isAdmin = roles.includes('ROLE_ADMIN') && !isSuperAdmin;`
+  - This lets us distinguish true super admins from normal admins.
+
+5.2. Mutation logic (what role the created user gets)
+
+- Before:
+  - If `isAdmin` and a `role` was chosen in the form, send that role; else default to `ROLE_USER`.
+- After:
+  - `mutationFn` now decides roles as follows:
+    - If `isSuperAdmin`:
+      - Look at the selected role from the form (`values.role`), defaulting to `ROLE_USER`.
+      - Send `[selectedRole]`.
+    - Else if `isAdmin`:
+      - Always send `['ROLE_EDITOR']`.
+    - Else (e.g. editor):
+      - Always send `['ROLE_USER']`.
+- This mirrors the backend rules, and prevents admins from choosing invalid roles from the UI side.
+
+5.3. Role dropdown visibility and choices
+
+- Before:
+  - The role select field appeared for any `isAdmin` (including super admin) and allowed selecting USER, EDITOR, ADMIN, SUPER_ADMIN.
+- After:
+  - The role select field is now shown **only** when `isSuperAdmin` is true.
+  - Options allowed to select are: USER, EDITOR, ADMIN.
+    - SUPER_ADMIN is removed from the dropdown to avoid promoting via UI.
+- For plain admins:
+  - No role dropdown is rendered.
+  - They just see a simple create-user form; the backend and mutation force new users to be EDITOR.
+
+--------------------------------------------------
+6. Frontend: Admin navigation and user management UI
+--------------------------------------------------
+
+Files:
+- prompt-ui-builder-main/src/components/Navigation.tsx
+- prompt-ui-builder-main/src/App.tsx
+- prompt-ui-builder-main/src/pages/Dashboard.tsx
+
+These changes were about re-introducing user management in a more polished way.
+
+6.1. Top navigation (Navigation.tsx)
+
+- Added an Admin dropdown using the shadcn `DropdownMenu` component, visible only if the current user has `ROLE_ADMIN` or `ROLE_SUPER_ADMIN`.
+- Inside the dropdown, there is an item linking to `/admin/users` labeled "User Management".
+- The standard links (Dashboard, Profile, Sign Out) remain for authenticated users; non-authenticated users see Sign In / Get Started.
+
+6.2. Routes (App.tsx)
+
+- Re-enabled user management routes, with proper `RequireRole` guards:
+  - `/admin/users` → `UserList`, requires any of `[ROLE_ADMIN, ROLE_SUPER_ADMIN]`.
+  - `/admin/users/new` → `UserCreate`, requires any of `[ROLE_ADMIN, ROLE_EDITOR, ROLE_SUPER_ADMIN]`.
+  - `/admin/users/:id/edit` → `UserEdit`, requires any of `[ROLE_ADMIN, ROLE_EDITOR, ROLE_SUPER_ADMIN]`.
+- All these routes are defined above the catch-all `*` route.
+
+6.3. Dashboard quick actions (Dashboard.tsx)
+
+- Added a third Quick Action card "User Management" which:
+  - Is visible only if the current user is admin or super admin (same role check as in Navigation).
+  - Navigates to `/admin/users` when clicked.
+- Existing disabled quick actions for "Edit Profile" and "Security Settings" remain.
+
+--------------------------------------------------
+7. High-level behavior summary
+--------------------------------------------------
+
+- Public registration (`/register`):
+  - Always creates a `ROLE_USER` account, regardless of client-sent roles.
+- User management (`/users` endpoints):
+  - Super admin can create ADMIN/EDITOR/USER and update roles freely among those.
+  - Admin can only create EDITOR and can only assign EDITOR via role updates.
+  - Editor (if permitted to call create) can only create USER.
+- UI alignment:
+  - Admin dropdown and dashboard quick action provide access to a user management area.
+  - Super admin sees a role dropdown when creating users.
+  - Admin does not see a role dropdown; all their created users become EDITOR.
+  - Registration page remains a simple self-service sign-up, always resulting in USER.

@@ -16,7 +16,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 @RestController
-@CrossOrigin(origins = "http://localhost:5173")
+@CrossOrigin(origins = "http://localhost:6969")
 public class AuthController {
 
     @Autowired
@@ -38,21 +38,14 @@ public class AuthController {
         users1.setUsername(users.getUsername());
         users1.setPassword(passwordEncoder.encode(users.getPassword()));
         users1.setEmail(users.getEmail());
-        Set<Role> strRoles =  users.getRoles();
+
+        // Registration endpoint is public: always register as plain USER, regardless of requested roles
         Set<Role> roles = new HashSet<>();
+        Role userRole = roleRepo.findByName("ROLE_USER")
+                .orElseThrow(() -> new RuntimeException("Role Not Found"));
+        roles.add(userRole);
 
-        if (strRoles == null){
-            Role userRole = roleRepo.findByName("ROLE_USER").orElseThrow(()-> new RuntimeException("Role Not Found"));
-            roles.add(userRole);
-        }else{
-            strRoles.forEach(role-> {
-                Role roleEntity = roleRepo.findByName(role.getName())
-                        .orElseThrow(()->new RuntimeException("Role not found"));
-            roles.add(roleEntity);
-            });
-        }
-
-     users1.setRoles(roles);
+        users1.setRoles(roles);
         usersRepo.save(users1);
         return ResponseEntity.ok("User Registered Successfully");
 

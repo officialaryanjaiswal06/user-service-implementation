@@ -1,0 +1,892 @@
+Spring Boot CMS IAM + Content Microservice Blueprint
+===================================================
+
+This file contains a minimal but reasonably "enterprise-style" blueprint for:
+
+- IAM (Identity & Access Management) Service
+- Content Service (example: About Us)
+
+It uses:
+- Spring Boot
+- Spring Security
+- JWT
+- PostgreSQL
+
+You can split this into two projects (iam-service, cms-content-service) and adjust package names.
+
+--------------------------------------------------
+1. IAM SERVICE – DATA MODEL
+--------------------------------------------------
+
+1.1. User entity
+----------------
+
+package com.example.iam.model;
+
+import jakarta.persistence.*;
+import java.util.HashSet;
+import java.util.Set;
+
+@Entity
+@Table(name = "users")
+public class User {
+
+  @Id
+  @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+
+  @Column(nullable = false, unique = true)
+  private String username;
+
+  @Column(nullable = false, unique = true)
+  private String email;
+
+  @Column(nullable = false)
+  private String passwordHash;
+
+  @Column(nullable = false)
+  private boolean enabled = true;
+
+  @ManyToMany(fetch = FetchType.LAZY)
+  @JoinTable(
+      name = "user_roles",
+      joinColumns = @JoinColumn(name = "user_id"),
+      inverseJoinColumns = @JoinColumn(name = "role_id")
+  )
+  private Set<Role> roles = new HashSet<>();
+
+  // getters and setters
+}
+
+
+1.2. Role entity
+----------------
+
+package com.example.iam.model;
+
+import jakarta.persistence.*;
+import java.util.HashSet;
+import java.util.Set;
+
+@Entity
+@Table(name = "roles")
+public class Role {
+
+  @Id
+  @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+
+  @Column(nullable = false, unique = true)
+  private String name; // e.g. SUPER_ADMIN, ADMIN, ABOUT_US_EDITOR
+
+  private String description;
+
+  @Column(nullable = false)
+  private boolean systemManaged = false; // true for built-ins
+
+  @ManyToMany(fetch = FetchType.LAZY)
+  @JoinTable(
+      name = "role_permissions",
+      joinColumns = @JoinColumn(name = "role_id"),
+      inverseJoinColumns = @JoinColumn(name = "permission_id")
+  )
+  private Set<Permission> permissions = new HashSet<>();
+
+  // getters and setters
+}
+
+
+1.3. Permission entity
+----------------------
+
+package com.example.iam.model;
+
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "permissions", uniqueConstraints = @UniqueConstraint(columnNames = "code"))
+public class Permission {
+
+  @Id
+  @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+
+  // e.g. ABOUT_US:READ, ABOUT_US:UPDATE, BLOG_POST:PUBLISH
+  @Column(nullable = false)
+  private String code;
+
+  @Column(nullable = false)
+  private String resource; // e.g. ABOUT_US
+
+  @Column(nullable = false)
+  private String action; // e.g. READ, UPDATE, PUBLISH
+
+  private String description;
+
+  // getters and setters
+}
+
+
+--------------------------------------------------
+2. IAM SERVICE – REPOSITORIES
+--------------------------------------------------
+
+UserRepository
+--------------
+
+package com.example.iam.repo;
+
+import com.example.iam.model.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+  Optional<User> findByUsername(String username);
+  boolean existsByUsername(String username);
+  boolean existsByEmail(String email);
+}
+
+
+RoleRepository
+--------------
+
+package com.example.iam.repo;
+
+import com.example.iam.model.Role;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface RoleRepository extends JpaRepository<Role, Long> {
+  Optional<Role> findByName(String name);
+  boolean existsByName(String name);
+}
+
+
+PermissionRepository
+--------------------
+
+package com.example.iam.repo;
+
+import com.example.iam.model.Permission;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface PermissionRepository extends JpaRepository<Permission, Long> {
+  Optional<Permission> findByCode(String code);
+}
+
+
+--------------------------------------------------
+3. IAM SERVICE – JWT UTIL & SECURITY
+--------------------------------------------------
+
+3.1. JwtUtil
+-------------
+
+package com.example.iam.security;
+
+import com.example.iam.model.Permission;
+import com.example.iam.model.Role;
+import com.example.iam.model.User;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.time.Instant;
+import java.util.Date;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Component
+public class JwtUtil {
+
+  private final SecretKey key = Keys.hmacShaKeyFor(
+      // use at least 256-bit secret; load from config/env in real code
+      "change-me-change-me-change-me-change-me-change-me-123456".getBytes()
+  );
+
+  private final long expirationMs = 1000L * 60 * 60; // 1 hour
+
+  public String generateToken(User user) {
+    List<String> roles = user.getRoles()
+        .stream()
+        .map(Role::getName)
+        .toList();
+
+    List<String> permissions = user.getRoles()
+        .stream()
+        .flatMap(r -> r.getPermissions().stream())
+        .map(Permission::getCode)
+        .distinct()
+        .collect(Collectors.toList());
+
+    Instant now = Instant.now();
+
+    return Jwts.builder()
+        .setSubject(user.getUsername())
+        .claim("roles", roles)
+        .claim("perms", permissions)
+        .setIssuedAt(Date.from(now))
+        .setExpiration(Date.from(now.plusMillis(expirationMs)))
+        .signWith(key, SignatureAlgorithm.HS256)
+        .compact();
+  }
+
+  public String getUsername(String token) {
+    return Jwts.parserBuilder()
+        .setSigningKey(key)
+        .build()
+        .parseClaimsJws(token)
+        .getBody()
+        .getSubject();
+  }
+
+  @SuppressWarnings("unchecked")
+  public List<String> getPermissions(String token) {
+    return (List<String>) Jwts.parserBuilder()
+        .setSigningKey(key)
+        .build()
+        .parseClaimsJws(token)
+        .getBody()
+        .get("perms", List.class);
+  }
+
+  public boolean validate(String token) {
+    try {
+      Jwts.parserBuilder().setSigningKey(key).build().parseClaimsJws(token);
+      return true;
+    } catch (Exception e) {
+      return false;
+    }
+  }
+}
+
+
+3.2. CustomUserDetailsService
+-----------------------------
+
+package com.example.iam.security;
+
+import com.example.iam.model.User;
+import com.example.iam.repo.UserRepository;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.*;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class CustomUserDetailsService implements UserDetailsService {
+
+  private final UserRepository userRepository;
+
+  public CustomUserDetailsService(UserRepository userRepository) {
+    this.userRepository = userRepository;
+  }
+
+  @Override
+  public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+    User user = userRepository.findByUsername(username)
+        .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+
+    List<GrantedAuthority> authorities = user.getRoles()
+        .stream()
+        .flatMap(r -> r.getPermissions().stream())
+        .map(p -> new SimpleGrantedAuthority(p.getCode())) // e.g. ABOUT_US:UPDATE
+        .collect(Collectors.toList());
+
+    return new org.springframework.security.core.userdetails.User(
+        user.getUsername(),
+        user.getPasswordHash(),
+        user.isEnabled(),
+        true,
+        true,
+        true,
+        authorities
+    );
+  }
+}
+
+
+3.3. JwtAuthFilter (for IAM service)
+------------------------------------
+
+package com.example.iam.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.*;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+
+@Component
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+  private final JwtUtil jwtUtil;
+  private final UserDetailsService userDetailsService;
+
+  public JwtAuthFilter(JwtUtil jwtUtil, CustomUserDetailsService userDetailsService) {
+    this.jwtUtil = jwtUtil;
+    this.userDetailsService = userDetailsService;
+  }
+
+  @Override
+  protected void doFilterInternal(
+      HttpServletRequest request,
+      HttpServletResponse response,
+      FilterChain filterChain
+  ) throws ServletException, IOException {
+
+    String authHeader = request.getHeader("Authorization");
+    String token = null;
+    String username = null;
+
+    if (authHeader != null && authHeader.startsWith("Bearer ")) {
+      token = authHeader.substring(7);
+      if (jwtUtil.validate(token)) {
+        username = jwtUtil.getUsername(token);
+      }
+    }
+
+    if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+      UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+      UsernamePasswordAuthenticationToken auth =
+          new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+      auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+      SecurityContextHolder.getContext().setAuthentication(auth);
+    }
+
+    filterChain.doFilter(request, response);
+  }
+}
+
+
+3.4. SecurityConfig (IAM service)
+---------------------------------
+
+package com.example.iam.config;
+
+import com.example.iam.security.JwtAuthFilter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.*;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.*;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.*;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.*;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+  private final JwtAuthFilter jwtAuthFilter;
+
+  public SecurityConfig(JwtAuthFilter jwtAuthFilter) {
+    this.jwtAuthFilter = jwtAuthFilter;
+  }
+
+  @Bean
+  public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .csrf(csrf -> csrf.disable())
+        .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/auth/login", "/auth/register").permitAll()
+            .anyRequest().authenticated()
+        )
+        .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+    return http.build();
+  }
+
+  @Bean
+  public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+    return config.getAuthenticationManager();
+  }
+
+  @Bean
+  public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+  }
+}
+
+
+--------------------------------------------------
+4. IAM SERVICE – AUTH & ADMIN CONTROLLERS
+--------------------------------------------------
+
+4.1. DTOs
+---------
+
+LoginRequest
+~~~~~~~~~~~~
+
+package com.example.iam.dto;
+
+public class LoginRequest {
+  private String username;
+  private String password;
+  // getters/setters
+}
+
+
+LoginResponse
+~~~~~~~~~~~~~
+
+package com.example.iam.dto;
+
+public class LoginResponse {
+  private String token;
+
+  public LoginResponse(String token) {
+    this.token = token;
+  }
+  public String getToken() { return token; }
+}
+
+
+CreateUserRequest
+~~~~~~~~~~~~~~~~~
+
+package com.example.iam.dto;
+
+public class CreateUserRequest {
+  private String username;
+  private String email;
+  private String password;
+  // getters/setters
+}
+
+
+4.2. AuthController
+-------------------
+
+package com.example.iam.controller;
+
+import com.example.iam.dto.*;
+import com.example.iam.model.Role;
+import com.example.iam.model.User;
+import com.example.iam.repo.RoleRepository;
+import com.example.iam.repo.UserRepository;
+import com.example.iam.security.JwtUtil;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.*;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.util.HashSet;
+import java.util.Set;
+
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+
+  private final AuthenticationManager authenticationManager;
+  private final JwtUtil jwtUtil;
+  private final UserRepository userRepository;
+  private final RoleRepository roleRepository;
+  private final PasswordEncoder passwordEncoder;
+
+  public AuthController(AuthenticationManager authenticationManager,
+                        JwtUtil jwtUtil,
+                        UserRepository userRepository,
+                        RoleRepository roleRepository,
+                        PasswordEncoder passwordEncoder) {
+    this.authenticationManager = authenticationManager;
+    this.jwtUtil = jwtUtil;
+    this.userRepository = userRepository;
+    this.roleRepository = roleRepository;
+    this.passwordEncoder = passwordEncoder;
+  }
+
+  @PostMapping("/login")
+  public ResponseEntity<LoginResponse> login(@RequestBody LoginRequest request) {
+    Authentication auth = authenticationManager.authenticate(
+        new UsernamePasswordAuthenticationToken(request.getUsername(), request.getPassword())
+    );
+
+    User user = userRepository.findByUsername(request.getUsername()).orElseThrow();
+    String token = jwtUtil.generateToken(user);
+    return ResponseEntity.ok(new LoginResponse(token));
+  }
+
+  @PostMapping("/register")
+  public ResponseEntity<?> register(@RequestBody CreateUserRequest req) {
+    if (userRepository.existsByUsername(req.getUsername())
+        || userRepository.existsByEmail(req.getEmail())) {
+      return ResponseEntity.badRequest().body("Username or email already exists");
+    }
+
+    User user = new User();
+    user.setUsername(req.getUsername());
+    user.setEmail(req.getEmail());
+    user.setPasswordHash(passwordEncoder.encode(req.getPassword()));
+
+    // Public registration: always USER
+    Role userRole = roleRepository.findByName("USER")
+        .orElseThrow(() -> new RuntimeException("USER role not found"));
+    Set<Role> roles = new HashSet<>();
+    roles.add(userRole);
+    user.setRoles(roles);
+
+    User saved = userRepository.save(user);
+    return ResponseEntity.created(URI.create("/users/" + saved.getId())).build();
+  }
+}
+
+
+4.3. Role/Permission Admin (simplified)
+--------------------------------------
+
+package com.example.iam.controller;
+
+import com.example.iam.model.Permission;
+import com.example.iam.model.Role;
+import com.example.iam.repo.PermissionRepository;
+import com.example.iam.repo.RoleRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.util.List;
+
+@RestController
+@RequestMapping("/admin/iam")
+public class RolePermissionAdminController {
+
+  private final RoleRepository roleRepository;
+  private final PermissionRepository permissionRepository;
+
+  public RolePermissionAdminController(RoleRepository roleRepository,
+                                       PermissionRepository permissionRepository) {
+    this.roleRepository = roleRepository;
+    this.permissionRepository = permissionRepository;
+  }
+
+  // Only SUPER_ADMIN should have this permission in real life: IAM:MANAGE_ROLES
+  @PreAuthorize("hasAuthority('IAM:MANAGE_ROLES')")
+  @PostMapping("/roles")
+  public ResponseEntity<Role> createRole(@RequestBody Role role) {
+    Role saved = roleRepository.save(role);
+    return ResponseEntity.created(URI.create("/admin/iam/roles/" + saved.getId())).body(saved);
+  }
+
+  @PreAuthorize("hasAuthority('IAM:MANAGE_ROLES')")
+  @PutMapping("/roles/{roleId}/permissions")
+  public ResponseEntity<Role> updateRolePermissions(
+      @PathVariable Long roleId,
+      @RequestBody List<String> permissionCodes) {
+
+    Role role = roleRepository.findById(roleId).orElseThrow();
+    List<Permission> perms = permissionRepository.findAll()
+        .stream()
+        .filter(p -> permissionCodes.contains(p.getCode()))
+        .toList();
+    role.getPermissions().clear();
+    role.getPermissions().addAll(perms);
+    Role saved = roleRepository.save(role);
+    return ResponseEntity.ok(saved);
+  }
+}
+
+
+--------------------------------------------------
+5. CONTENT SERVICE – SECURITY (JWT)
+--------------------------------------------------
+
+5.1. ContentJwtAuthFilter
+-------------------------
+
+In a separate project (cms-content-service), you can reuse JwtUtil (from a shared library) and create:
+
+package com.example.content.security;
+
+import com.example.iam.security.JwtUtil; // or move JwtUtil to a shared module
+import jakarta.servlet.*;
+import jakarta.servlet.http.*;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Component
+public class ContentJwtAuthFilter extends OncePerRequestFilter {
+
+  private final JwtUtil jwtUtil;
+
+  public ContentJwtAuthFilter(JwtUtil jwtUtil) {
+    this.jwtUtil = jwtUtil;
+  }
+
+  @Override
+  protected void doFilterInternal(
+      HttpServletRequest request,
+      HttpServletResponse response,
+      FilterChain filterChain
+  ) throws ServletException, IOException {
+
+    String authHeader = request.getHeader("Authorization");
+    if (authHeader != null && authHeader.startsWith("Bearer ")) {
+      String token = authHeader.substring(7);
+      if (jwtUtil.validate(token)) {
+        String username = jwtUtil.getUsername(token);
+        List<String> perms = jwtUtil.getPermissions(token);
+        var authorities = perms.stream()
+            .map(SimpleGrantedAuthority::new)
+            .collect(Collectors.toList());
+
+        var auth = new UsernamePasswordAuthenticationToken(username, null, authorities);
+        SecurityContextHolder.getContext().setAuthentication(auth);
+      }
+    }
+
+    filterChain.doFilter(request, response);
+  }
+}
+
+
+5.2. SecurityConfig (Content service)
+-------------------------------------
+
+package com.example.content.config;
+
+import com.example.content.security.ContentJwtAuthFilter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.*;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.*;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+  private final ContentJwtAuthFilter jwtFilter;
+
+  public SecurityConfig(ContentJwtAuthFilter jwtFilter) {
+    this.jwtFilter = jwtFilter;
+  }
+
+  @Bean
+  public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .csrf(csrf -> csrf.disable())
+        .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/about-us/public").permitAll()
+            .anyRequest().authenticated()
+        )
+        .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+
+    return http.build();
+  }
+}
+
+
+--------------------------------------------------
+6. CONTENT SERVICE – ABOUT US EXAMPLE
+--------------------------------------------------
+
+6.1. AboutUsPage entity
+-----------------------
+
+package com.example.content.model;
+
+import jakarta.persistence.*;
+import java.time.Instant;
+
+@Entity
+@Table(name = "about_us_page")
+public class AboutUsPage {
+
+  @Id
+  @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+
+  @Column(nullable = false)
+  private String title;
+
+  @Lob
+  @Column(nullable = false)
+  private String body;
+
+  @Column(nullable = false)
+  private String status; // DRAFT, PUBLISHED
+
+  private Instant updatedAt;
+
+  private String updatedBy; // username
+
+  // getters and setters
+}
+
+
+6.2. AboutUsPageRepository
+--------------------------
+
+package com.example.content.repo;
+
+import com.example.content.model.AboutUsPage;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface AboutUsPageRepository extends JpaRepository<AboutUsPage, Long> {
+  AboutUsPage findFirstByStatusOrderByUpdatedAtDesc(String status);
+}
+
+
+6.3. DTOs
+---------
+
+AboutUsUpdateRequest
+~~~~~~~~~~~~~~~~~~~~
+
+package com.example.content.dto;
+
+public class AboutUsUpdateRequest {
+  private String title;
+  private String body;
+  // getters/setters
+}
+
+
+AboutUsDto
+~~~~~~~~~~
+
+package com.example.content.dto;
+
+public class AboutUsDto {
+  private String title;
+  private String body;
+
+  public AboutUsDto() {}
+
+  public AboutUsDto(String title, String body) {
+    this.title = title;
+    this.body = body;
+  }
+
+  // getters/setters
+}
+
+
+6.4. AboutUsController with permissions
+--------------------------------------
+
+package com.example.content.controller;
+
+import com.example.content.dto.*;
+import com.example.content.model.AboutUsPage;
+import com.example.content.repo.AboutUsPageRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+
+@RestController
+@RequestMapping("/about-us")
+public class AboutUsController {
+
+  private final AboutUsPageRepository repo;
+
+  public AboutUsController(AboutUsPageRepository repo) {
+    this.repo = repo;
+  }
+
+  // Public endpoint: show published page
+  @GetMapping("/public")
+  public ResponseEntity<AboutUsDto> getPublic() {
+    AboutUsPage page = repo.findFirstByStatusOrderByUpdatedAtDesc("PUBLISHED");
+    if (page == null) return ResponseEntity.notFound().build();
+    return ResponseEntity.ok(new AboutUsDto(page.getTitle(), page.getBody()));
+  }
+
+  // Admin/editor endpoint: read latest (draft or published)
+  @PreAuthorize("hasAuthority('ABOUT_US:READ')")
+  @GetMapping("/admin")
+  public ResponseEntity<AboutUsDto> getAdmin() {
+    AboutUsPage page = repo.findFirstByStatusOrderByUpdatedAtDesc("DRAFT");
+    if (page == null) page = repo.findFirstByStatusOrderByUpdatedAtDesc("PUBLISHED");
+    if (page == null) return ResponseEntity.notFound().build();
+    return ResponseEntity.ok(new AboutUsDto(page.getTitle(), page.getBody()));
+  }
+
+  // Update content (e.g. ABOUT_US_EDITOR)
+  @PreAuthorize("hasAuthority('ABOUT_US:UPDATE')")
+  @PutMapping("/admin")
+  public ResponseEntity<AboutUsDto> update(
+      @RequestBody AboutUsUpdateRequest req,
+      Authentication auth) {
+
+    AboutUsPage page = repo.findFirstByStatusOrderByUpdatedAtDesc("DRAFT");
+    if (page == null) {
+      page = new AboutUsPage();
+      page.setStatus("DRAFT");
+    }
+    page.setTitle(req.getTitle());
+    page.setBody(req.getBody());
+    page.setUpdatedAt(Instant.now());
+    page.setUpdatedBy(auth.getName());
+
+    AboutUsPage saved = repo.save(page);
+    return ResponseEntity.ok(new AboutUsDto(saved.getTitle(), saved.getBody()));
+  }
+
+  // Publish content (e.g. ABOUT_US_PUBLISHER)
+  @PreAuthorize("hasAuthority('ABOUT_US:PUBLISH')")
+  @PostMapping("/admin/publish")
+  public ResponseEntity<Void> publish(Authentication auth) {
+    AboutUsPage draft = repo.findFirstByStatusOrderByUpdatedAtDesc("DRAFT");
+    if (draft == null) return ResponseEntity.badRequest().build();
+
+    draft.setStatus("PUBLISHED");
+    draft.setUpdatedAt(Instant.now());
+    draft.setUpdatedBy(auth.getName());
+    repo.save(draft);
+
+    return ResponseEntity.noContent().build();
+  }
+}
+
+
+--------------------------------------------------
+NOTES
+--------------------------------------------------
+
+- Adjust package names, imports, and Maven/Gradle dependencies as needed.
+- Use Flyway/Liquibase to generate the corresponding PostgreSQL tables.
+- Create initial roles and permissions at startup (e.g. SUPER_ADMIN, ADMIN, ABOUT_US:READ/UPDATE/PUBLISH, IAM:MANAGE_ROLES).
+- In production, move JwtUtil and shared models into a separate shared library used by both IAM and content services.
